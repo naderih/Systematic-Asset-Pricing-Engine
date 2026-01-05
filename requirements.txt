@@ -1,0 +1,8 @@
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+statsmodels>=0.14.0
+pandas-datareader>=0.10.0
+pyarrow>=12.0.0  # Required for reading Parquet files
+scipy>=1.10.0
+jupyterlab>=4.0.0

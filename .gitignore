@@ -1,0 +1,28 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# --- Data & Outputs (CRITICAL) ---
+# We ignore these to keep the repo lightweight
+*.parquet
+*.csv
+*.dta
+*.sas7bdat
+data/
+outputs/
+temp/
+
+# --- IDE Settings ---
+.vscode/
+.idea/
+*.ipynb_checkpoints/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
