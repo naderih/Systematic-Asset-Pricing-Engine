@@ -1,5 +1,5 @@
 # Systematic Asset Pricing Engine
-
+![alt text](image.png)
 ## Overview
 This repository implements an end-to-end active portfolio management system based on the **Grinold-Kahn framework**. It is designed to rigorously test quantitative investment strategies by isolating idiosyncratic alpha from systematic risk.
 
