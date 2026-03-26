@@ -11,7 +11,7 @@ OBJECTIVE:
 METHODOLOGY:
     1. Cross-Sectional Regression (Fama-MacBeth Step 1):
        For each time period t, we regress the cross-section of stock returns (R_t) 
-       on their factor exposures (X_t):
+       on their factor exposures (X_t) using OLS or WLS with specific risk as regression weights:
        R_{i,t} = X_{i,t} * F_t + u_{i,t}
        
        This gives us:
@@ -41,9 +41,21 @@ class RiskModel:
                          36 months is standard for a medium-term risk model.
     """
     
-    def __init__(self, data_dir, half_life=36):
-        self.data_dir = data_dir
+    def __init__(self, 
+                 panel_path, 
+                 factors_path, 
+                 risk_output_folder_path,
+                 half_life=36, 
+                 regression_weighting = "OLS"):
+        
+        self.panel_path = panel_path
+        self.factors_path = factors_path
+        self.risk_output_folder_path = risk_output_folder_path
         self.half_life = half_life
+
+        if regression_weighting not in ['OLS', 'WLS']:
+            raise ValueError("regression_method must be 'OLS' or 'WLS'")
+        self.regression_weighting = regression_weighting
         
     def load_data(self):
         """
@@ -54,16 +66,14 @@ class RiskModel:
         print("Loading Data for Risk Model...")
         
         # Load Returns
-        panel_path = os.path.join(self.data_dir, 'panel_data.parquet')
-        if not os.path.exists(panel_path):
-            raise FileNotFoundError(f"Missing {panel_path}")
-        self.panel_data = pd.read_parquet(panel_path)
+        if not os.path.exists(self.panel_path):
+            raise FileNotFoundError(f"Missing {self.panel_path}")
+        self.panel_data = pd.read_parquet(self.panel_path)
         
         # Load Exposures (The X matrix)
-        exp_path = os.path.join(self.data_dir, 'factor_exposures.parquet')
-        if not os.path.exists(exp_path):
-            raise FileNotFoundError(f"Missing {exp_path}")
-        self.exposures = pd.read_parquet(exp_path)
+        if not os.path.exists(self.factors_path):
+            raise FileNotFoundError(f"Missing {self.factors_path}")
+        self.exposures = pd.read_parquet(self.factors_path)
         
         # --- Robust Index Handling ---
         # Ensure we have a clean (permno, date) MultiIndex for alignment
@@ -84,12 +94,13 @@ class RiskModel:
         Runs period-by-period cross-sectional regressions to extract 
         Factor Returns (F_t) and Specific Returns (u_t).
         """
-        print("Running Fama-MacBeth Regressions...")
+        print("Running Fama-MacBeth Regressions to extract Factor Returns (F_t) and Specific Returns (u_t)")
+        print(f"using cross-sectional {self.regression_weighting} regressions ...")
         
         # 1. Align Data
         # We perform an INNER JOIN on (permno, date). 
         # A stock must have both a return and exposures to be included in the risk model estimation.
-        y = self.panel_data[['ret_monthly']]
+        y = self.panel_data[['ret_monthly', 'mkt_cap']]
         X = self.exposures
         
         aligned = y.join(X, how='inner')
@@ -110,7 +121,7 @@ class RiskModel:
         resid_list = []
         
         # Identify regressors (everything except the return column)
-        factor_cols = [c for c in aligned.columns if c != 'ret_monthly']
+        factor_cols = [c for c in aligned.columns if c not in ['ret_monthly', 'mkt_cap']]
         
         for date in dates:
             # Efficiently slice data for the current month
@@ -128,11 +139,15 @@ class RiskModel:
                 continue
 
             try:
+                if self.regression_weighting == "OLS":
                 # OLS Regression: R_i = Beta * F + epsilon
                 # Note: We do NOT add a constant because 'Market' or 'Industry' factors usually span the intercept.
-                model = sm.OLS(y_t, X_t, missing='drop')
-                results = model.fit()
-                
+                    model = sm.OLS(y_t, X_t, missing='drop')
+                    results = model.fit()
+                elif self.regression_weighting == "WLS":
+                    weights = np.sqrt(monthly_slice['mkt_cap'].astype(float))
+                    results = sm.WLS(y_t, X_t, weights=weights, missing='drop').fit()
+
                 # A. Store Factor Returns (Coefficients)
                 f_t = results.params
                 f_t.name = date
@@ -163,7 +178,7 @@ class RiskModel:
         
         self.specific_returns.sort_index(inplace=True)
         
-        print(f"Fama-MacBeth Complete. Estimated {len(self.factor_returns)} periods.")
+        print(f"Fama-MacBeth Complete. Estimated F & u for {len(self.factor_returns)} periods.")
     
     
     def predict_risk_matrices(self):
@@ -174,11 +189,14 @@ class RiskModel:
         """
         print("Forecasting Risk Matrices...")
         
+        print("1. Forecast Factor Covariance Matrix (F)...")
         # 1. Forecast Factor Covariance Matrix (F)
         # We calculate the rolling EWMA covariance of the factor return history.
         # Result is a Panel: (Date, Factor, Factor)
-        self.factor_cov_matrices = self.factor_returns.ewm(halflife=self.half_life).cov()
-        
+        self.factor_cov_matrices = self.factor_returns.ewm(
+            halflife=self.half_life, min_periods=self.half_life).cov()
+
+        print("2. Forecast Idiosyncratic Variance (Delta)...")
         # 2. Forecast Idiosyncratic Variance (Delta)
         # We square the residuals to get specific variance
         # Unstack to (Date, Permno) to leverage pandas' time-series ewm() function
@@ -186,11 +204,12 @@ class RiskModel:
         u_sq = u_wide ** 2
         
         # Apply EWMA smoothing
-        self.idio_var = u_sq.ewm(halflife=self.half_life).mean()
+        self.idio_var = u_sq.ewm(halflife=self.half_life, 
+                                 min_periods=self.half_life).mean()
         self.idio_vol = np.sqrt(self.idio_var)
         
         # Restack to (date, permno) long format for efficient storage
-        self.idio_vol = self.idio_vol.stack().to_frame('resid_vol')
+        self.idio_vol = self.idio_vol.stack(future_stack=True).to_frame('resid_vol').dropna()
         self.idio_vol.index.names = ['date', 'permno']
         self.idio_vol.sort_index(inplace=True)
 
@@ -203,15 +222,22 @@ class RiskModel:
         print("Saving Risk Outputs...")
         
         # 1. Factor Covariance (Systematic Risk)
-        path_cov = os.path.join(self.data_dir, 'factor_cov_matrices.parquet')
+        path_cov = os.path.join(self.risk_output_folder_path, 'factor_cov_matrices.parquet')
         self.factor_cov_matrices.to_parquet(path_cov)
         
         # 2. Idiosyncratic Volatility (Specific Risk)
-        path_vol = os.path.join(self.data_dir, 'idio_vol.parquet')
+        path_vol = os.path.join(self.risk_output_folder_path, 'idio_vol.parquet')
         self.idio_vol.to_parquet(path_vol)
         
-        print(f"Saved: {path_cov}")
-        print(f"Saved: {path_vol}")
+        print(f"Factor covariance matrix saved to: {path_cov}")
+        print(f"Idiosyncratic volaility saved to: {path_vol}")
+    
+    def run_risk_pipeline(self):
+        self.load_data()
+        self.run_fama_macbeth()
+        self.predict_risk_matrices()
+        self.save_outputs()
+    
 
 if __name__ == "__main__":
     pass

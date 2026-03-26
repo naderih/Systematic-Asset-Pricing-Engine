@@ -12,13 +12,19 @@ METHODOLOGY:
        (Winsorized to prevent outlier distortion).
 
     2. Orthogonalization (The "Residual" Approach):
-       We seek the component of the signal that is *uncorrelated* with the market.
-       Math: Alpha = Signal - (Beta * (Cov(Signal, Beta) / Var(Beta)))
-       In a cap-weighted framework, this simplifies to ensuring the signal has 
-       zero beta exposure relative to the benchmark.
+       We want the Benchmark to have alpha of zero 
+       because we seek the component of the signal that is *uncorrelated* with the market.
+       We want h_Bᵀ * α_final = 0
+       α_final,n = α_raw,n - β_n * α_B_raw
+       
+       In matrix form: 
+       α_final = α_raw - (Beta_(vactor) * α_B_raw_(scalar)
+
+       By making the alpha vector benchmark-neutral, we guarantee that the 
+       optimal portfolio constructed from this signal will have zero active beta.
 
     3. Signal Combination & Smoothing:
-       - Combines single factors into a composite (e.g., Long Momentum + Short Distress).
+       - Combines single factors into a composite (e.g., Long Momentum + Short Constraints).
        - Applies a 3-month rolling average to reduce turnover ("Flicker Reduction").
 
     4. Standardization:
@@ -27,9 +33,6 @@ METHODOLOGY:
 
 import os
 import pandas as pd
-import numpy as np
-import statsmodels.api as sm
-from statsmodels.regression.rolling import RollingOLS
 
 class AlphaEngine:
     """
@@ -41,32 +44,46 @@ class AlphaEngine:
     - constructing the final composite signal for the Portfolio Optimizer.
     """
     
-    def __init__(self, data_dir):
+    def __init__(self, 
+                 panel_path: str,
+                 factors_path: str,
+                 alpha_output_folder_path: str,  
+                 alpha_columns: dict, 
+                 beta_window: int = 60, 
+                 min_beta_obs:int = 36):
         """
         Args:
-            data_dir (str): Path to the processed parquet datasets.
+            panel_path (str): Path to the panel parquet dataset
+            factors_path (str): Path to the factors exposures parquet dataset
+            output_fodler_path (str): Path for the saved output alpha_signal parquet file 
+            alpha_columns (dict): a dictionary where keys are the name of the alpha columns in the panel data and the values are the sign e.g. {'momentum': 1, 'fin_constraints': -1}, 
+            beta_window: The historical window used to estimate the beta, 
+            min_beta_obs: The minimum number of observations in beta_window to allow for calculation of beta 
         """
-        self.data_dir = data_dir
+        self.panel_path = panel_path
+        self.factors_path = factors_path
+        self.alpha_output_folder_path = alpha_output_folder_path
         
         # Configuration for Beta Estimation
-        self.beta_window = 60        # 5-Year rolling window
-        self.min_beta_obs = 36       # Minimum 3 years of history required
-        self.beta_winsor_lower = 0.01 # Lower bound percentile
-        self.beta_winsor_upper = 0.99 # Upper bound percentile
+        self.beta_window = beta_window        # 5-Year rolling window
+        self.min_beta_obs = min_beta_obs       # Minimum 3 years of history required
+
+        self.alpha_columns = alpha_columns
+
+        self.beta_winsor_lower = 0.05 # Lower bound percentile
+        self.beta_winsor_upper = 0.95 # Upper bound percentile
 
     def load_data(self):
         """
         Loads and joins the Panel Data (Returns/Caps) and Factor Exposures (X Matrix).
         """
         print("Loading datasets...")
-        panel_path = os.path.join(self.data_dir, 'panel_data.parquet')
-        factors_path = os.path.join(self.data_dir, 'factor_exposures.parquet')
-
-        if not os.path.exists(panel_path) or not os.path.exists(factors_path):
+        
+        if not os.path.exists(self.panel_path) or not os.path.exists(self.factors_path):
             raise FileNotFoundError(f"Missing input files in {self.data_dir}")
 
-        panel_data = pd.read_parquet(panel_path)
-        x_factors = pd.read_parquet(factors_path)
+        panel_data = pd.read_parquet(self.panel_path)
+        x_factors = pd.read_parquet(self.factors_path)
 
         # Ensure multi-index alignment for join
         for df in [panel_data, x_factors]:
@@ -76,179 +93,170 @@ class AlphaEngine:
 
         # Merge specific columns required for the alpha process
         market_data = panel_data[['ret_monthly', 'mkt_cap', 'vwretd']]
-        alpha_signals = x_factors[['Momentum', 'FinConstraint']]
+        alpha_signals = x_factors[[*self.alpha_columns]]
         
         # Inner join to ensure we only process stocks where we have both data types
         df = market_data.join(alpha_signals, how='inner').dropna()
         print(f"Data loaded. Final shape: {df.shape}")
         return df
 
-    def calculate_rolling_betas(self, df):
+    def calculate_rolling_betas(self, df): 
+        
         """
         Calculates time-varying market betas using rolling OLS.
         
         Model: r_stock = alpha + beta * r_market + epsilon
-        Window: 60 months (5 years).
+        Window: 60 months (5 years). calculates if  36 months of data is present
         """
-        print("Calculating rolling betas (this may take a moment)...")
-
-        def _rolling_beta(group):
-            if len(group) < self.min_beta_obs:
-                return pd.Series(np.nan, index=group.index)
-            
-            y = group['ret_monthly']
-            X = sm.add_constant(group['vwretd'])
-            
-            try:
-                rols = RollingOLS(y, X, window=self.beta_window, min_nobs=self.min_beta_obs)
-                results = rols.fit()
-                return results.params['vwretd']
-            except:
-                return pd.Series(np.nan, index=group.index)
-
-        # Group by PERMNO to run regression per stock
-        rolling_betas = df.groupby('permno', group_keys=False).apply(_rolling_beta)
-        df['beta'] = rolling_betas
+        print("Calculating rolling betas as Cov(r_n, r_mkt) / Var(r_Mkt) ...")
         
-        # Report coverage statistics
+        # Pre-calculate Market Variance once for the whole timeline
+        # This avoids calculating the same number 1000s of times
+        mkt_var = (df.groupby('date')['vwretd'].mean().rolling(window = self.beta_window, 
+                                                              min_periods = self.min_beta_obs)
+                                                              .var())
+        def _rolling_beta_cov(group):
+            # Calculate covariance for this specific stock
+            cov = (group['ret_monthly'].rolling(window = self.beta_window, 
+                                               min_periods = self.min_beta_obs)
+                                               .cov(group['vwretd']))
+            
+            # mkt_var is a series of market variance calculated for every date in our universe 
+            # the stock from this specific group may not exist on some of those dates 
+            mkt_var_valid = mkt_var.reindex(group.index.get_level_values('date'))
+            return cov / mkt_var_valid
+
+        rolling_beta_cov= df.groupby('permno', group_keys = False).apply(_rolling_beta_cov)
+        
+        df['beta'] = rolling_beta_cov
+        
         valid_betas = df['beta'].notna().sum()
-        print(f"Beta calculation complete. Valid estimates: {valid_betas} / {len(df)}")
+        print(f"Beta calculation complete. Valid estimates: {valid_betas} / {len(df)} = {valid_betas/ len(df):.2f}")
+        
         return df
 
+       
     def winsorize_betas(self, df):
         """
         Winsorizes betas cross-sectionally (per date) to remove estimation errors.
         
-        Why? Rolling regressions on small caps often produce wild beta estimates (e.g., -5.0 or +10.0)
+        Rolling regressions on small caps often produce wild beta estimates (e.g., -5.0 or +10.0)
         due to liquidity events or data errors. These outliers would distort the neutralization step.
         """
         print(f"Winsorizing betas ({self.beta_winsor_lower*100}% - {self.beta_winsor_upper*100}%)...")
         
-        df['beta_winsorized'] = df.groupby('date')['beta'].transform(
-            lambda x: x.clip(
-                lower=x.quantile(self.beta_winsor_lower),
-                upper=x.quantile(self.beta_winsor_upper)
-            )
-        )
+        lower = df.groupby('date')['beta'].transform(lambda x: x.quantile(self.beta_winsor_lower))
+        upper = df.groupby('date')['beta'].transform(lambda x: x.quantile(self.beta_winsor_upper))
+
+        df['beta_winsorized'] = df['beta'].clip(lower= lower , upper = upper)
         return df
 
-    def _neutralize_single_period(self, group, signal_col):
+    def create_composite_and_smooth_alpha(self, df):
         """
-        Internal Helper: Performs Gram-Schmidt orthogonalization for a single date.
+        Composite alpha signal is calcualted as the mean of other alpha signals 
+        For smoothing, we take a 3-month rolling mean of the raw signals and the composite signal.
+        """
+        print(f"Constructing composite alpha signal ...")
+        running_total = pd.Series(0.0, index = df.index)
         
-        Objective: Construct a signal S* such that Beta(S*) = 0.
-        Formula:   S* = S - (Beta * k)
-        Where k is a scaling factor ensuring the cap-weighted sum of the new signal is zero relative to beta.
-        """
-        required = ['mkt_cap', 'beta_winsorized', signal_col]
-        clean_group = group.dropna(subset=required)
+        for signal, sign in self.alpha_columns.items():
+            running_total += sign * df[signal]
+        df['composite'] = running_total / len(self.alpha_columns)
 
-        if clean_group.empty:
-            return pd.Series(dtype='float64')
-
-        # 1. Calculate Cap-Weighted properties of the Signal and the Benchmark (Beta)
-        weights = clean_group['mkt_cap'] / clean_group['mkt_cap'].sum()
-        bench_alpha = (clean_group[signal_col] * weights).sum()
-        bench_beta = (clean_group['beta_winsorized'] * weights).sum()
-
-        # 2. Orthogonalize
-        # If the benchmark has zero beta (unlikely), we just center the signal.
-        if np.isclose(bench_beta, 0):
-            return clean_group[signal_col] - bench_alpha
-        
-        # Calculate the projection of the Signal onto Beta
-        adj_factor = bench_alpha / bench_beta
-        
-        # Subtract the systematic component
-        return clean_group[signal_col] - (clean_group['beta_winsorized'] * adj_factor)
-
-    def neutralize_signals(self, df, signal_names=['Momentum', 'FinConstraint']):
-        """
-        Iterates through signals and removes their systematic market exposure.
-        """
-        for signal in signal_names:
-            print(f"Neutralizing signal: {signal}...")
-            # Apply the helper function group-wise by date
-            neutralized = df.groupby('date', group_keys=False).apply(
-                lambda g: self._neutralize_single_period(g, signal)
-            )
-            df[f'alpha_{signal}'] = neutralized
-        return df
-
-    def finalize_signals(self, df):
-        """
-        Constructs the final Composite and standardizes it for the optimizer.
-        """
-        print("Finalizing signals...")
-        
-        # 1. Create Composite Alpha
-        # Logic: We like Momentum (High is Good) and dislike Distress (High is Bad).
-        # Therefore: Composite = (Momentum - FinConstraint) / 2
-        df['alpha_composite'] = (df['alpha_Momentum'] - df['alpha_FinConstraint']) / 2
-        
-        # 2. Alpha Smoothing (Turnover Reduction)
         # We take a 3-month rolling mean of the raw composite.
-        # This keeps the "trend" but removes the monthly "flicker", significantly reducing trading costs.
-        print("Smoothing Alpha (3-month rolling average)...")
-        df['alpha_composite'] = df.groupby('permno')['alpha_composite'].transform(
-            lambda x: x.rolling(3, min_periods=1).mean()
-        )
-        
-        # 3. Z-Score Standardization (Unit Variance)
-        # We divide by cross-sectional Std Dev so the optimizer sees a signal ~ N(0, 1).
-        # Note: We do NOT demean here, because the neutralization step already centered it 
-        # relative to the benchmark.
-        print("Scaling signals to Unit Variance...")
-        targets = {
-            'alpha_Momentum': 'alpha_Momentum_final',
-            'alpha_FinConstraint': 'alpha_FinConstraint_final',
-            'alpha_composite': 'alpha_Composite_final'
-        }
-        
-        for raw_col, final_col in targets.items():
-            df[final_col] = df.groupby('date')[raw_col].transform(
-                lambda x: x / x.std()
-            )
-        
-        # 4. Cleanup
-        final_cols = list(targets.values())
-        result_df = df[final_cols].copy()
-        result_df.fillna(0, inplace=True)
-        
-        return result_df
+        # This keeps the "trend" but removes the monthly "flicker", reducing trading costs.
 
-    def verify_neutrality(self, df, final_df):
+        print("Smooothing the alpha signals...")
+        signal_cols = [*self.alpha_columns, 'composite']
+        for signal in signal_cols:
+            smooth = (df.groupby('permno')[signal]
+                      .rolling(window = 3, min_periods = 1)
+                      .mean()
+                      .reset_index(level = 0 , drop = True))
+            df[f"{signal}_smooth"] = smooth
+        return df 
+
+    def neutralize_signals(self, df):
         """
-        Verification Step: Calculates the ex-ante Beta of the final signal.
-        If the math is correct, the Cap-Weighted sum of (Signal * Beta) should be effectively zero.
+        Performs Gram- Schmidt orthogonalization for each signal:
+        The texhtbook formula is : α_final,n = α_raw,n - β_n * α_B_raw 
+        But because we winsorized beta and have missing observations, 
+        the formaul is adjusted so that the alpha for the benchmark is forced to zero
+        α_final,n = α_raw,n - β_n * α_B_raw / β_market 
         """
-        print("\n--- Verifying Signal Neutrality ---")
-        # Re-attach mkt_cap for verification
-        check_df = final_df.join(df['mkt_cap'])
-        check_df['weight'] = check_df.groupby('date')['mkt_cap'].transform(lambda x: x/x.sum())
+        print("Making the alpha signal benchmark-neutral:")
+        print("Orthogonalizing Alphas...")
+
+        signal_columns_original = [*self.alpha_columns, 'composite']
+        signal_columns_smooth = [c for c in df.columns if c.endswith('smooth')]
+        signal_columns = signal_columns_original + signal_columns_smooth
+
+
+        for signal in signal_columns:
+            # 1. Isolate only rows that have complete data for THIS specific signal
+            valid = df[['mkt_cap', 'beta_winsorized', signal]].dropna().copy()
+            
+            #2. calculate cap weights for each date 
+            sum_cap = df.groupby(level = 'date')['mkt_cap'].transform('sum')
+            weight = valid['mkt_cap'] / sum_cap
+
+            #3. calculate benchmark alpha and beta at each date 
+            weight_by_beta = weight * valid['beta_winsorized']
+            weight_by_alpha = weight * valid[signal]
+            
+            valid['bench_beta'] = weight_by_beta.groupby(level = 'date').transform('sum')
+            valid['bench_alpha'] = weight_by_alpha.groupby(level = 'date').transform('sum')
+            
+            #4. calcualte the orthogonalized signal
+            signal_orthogonalized = (valid[signal] - valid['beta_winsorized'] 
+                                     * (valid['bench_alpha'] / valid['bench_beta']))
+            
+            
+            # Signals were previously standardized in the engine. 
+            # However, alpha signals are orthogonalized to the benchmark, 
+            # so, they are no longer standardized
+            # we dont demean here, because they're orthgonalized with the benchark 
+            # and demeaning the signals would violate the benchmakr-neutrality 
+            signal_std = signal_orthogonalized.groupby(level = 'date').transform('std')
+            df[f'alpha_{signal}'] = signal_orthogonalized / signal_std
+            df[f'alpha_{signal}'] = df[f'alpha_{signal}'].fillna(0)
+
+        return df 
+    
+    def verify_neutrality(self, df):
+        alpha_cols = [c for c in df.columns if c.startswith('alpha')]
+        market_alpha_means = pd.Series(index = alpha_cols, dtype = float)
         
-        # The 'Bias' is the systematic exposure remaining in the portfolio
-        bias = (check_df['alpha_Composite_final'] * check_df['weight']).groupby('date').sum().mean()
+        sum_cap = df.groupby('date')['mkt_cap'].transform('sum')
+        weight = df['mkt_cap'] / sum_cap
+
+        for col in alpha_cols:
+            alpha_by_weight = weight * df[col]
+            market_alpha_means[col] = alpha_by_weight.groupby(level = 'date').sum().mean()
+
+        max_bias = market_alpha_means.abs().max()
         
-        print(f"Average Benchmark-Weighted Alpha Bias: {bias:.10f}")
-        if abs(bias) < 1e-8:
-            print("SUCCESS: Signal is orthogonal to the benchmark.")
+        if max_bias < 1e-7:
+            print('SUCCESS: All alphas are benchmark-neutral.')
         else:
-            print("WARNING: Signal retains systematic bias.")
+            print(f'WARNING: Signals retain systematic bias! Max bias: {max_bias}')
+            print(market_alpha_means)
 
-    def run_pipeline(self):
+    def run_alpha_pipeline(self):
         """
         Executes the full Alpha Generation workflow.
         """
         df = self.load_data()
         df = self.calculate_rolling_betas(df)
         df = self.winsorize_betas(df)
+        df = self.create_composite_and_smooth_alpha(df)
         df = self.neutralize_signals(df)
-        final_signals = self.finalize_signals(df)
-        
-        self.verify_neutrality(df, final_signals)
-        
-        output_path = os.path.join(self.data_dir, 'alpha_signals.parquet')
+        self.verify_neutrality(df)
+
+        alpha_cols = [c for c in df.columns if c.startswith('alpha')]
+        final_signals = df[alpha_cols]
+
+        output_path = os.path.join(self.alpha_output_folder_path, 'alpha_signals.parquet')
         final_signals.to_parquet(output_path)
         print(f"\nPipeline complete. Saved to: {output_path}")
 

@@ -11,10 +11,10 @@ METHODOLOGY:
        Maps SIC codes to Fama-French 12 Industries to capture sector risk.
 
     2. Composite Style Factors:
-       - Value: Composite of B/M (lagged 6mo) and E/P (lagged 3mo).
-       - Momentum: Composite of 12-1 Month and 6-1 Month returns.
+       - value: Composite of B/M (lagged 6mo) and E/P (lagged 3mo).
+       - momentum: Composite of 12-1 Month and 6-1 Month returns.
        - Financial Constraints: Whited-Wu Index (Cash Flow, Leverage, Dividend, Sales Growth).
-       - Size: Log(Market Cap).
+       - size: Log(Market Cap).
 
     3. Capitalization-Weighted Standardization:
        Factors are standardized cross-sectionally using market-cap weights to 
@@ -25,10 +25,9 @@ METHODOLOGY:
        Strictly enforces reporting lags (using 'rdq' or 'datadate' offsets) to 
        ensure no information is used before it was publicly available.
 """
-
+import os
 import pandas as pd
 import numpy as np
-from typing import Optional
 
 class FactorEngine:
     """
@@ -41,15 +40,24 @@ class FactorEngine:
     - Sector dummy generation.
     """
     
-    def __init__(self, panel_data: pd.DataFrame):
+    def __init__(self, 
+                 panel_path: str,
+                 factors_path: str):
         """
         Args:
             panel_data: Monthly panel containing market data (mkt_cap, ret_monthly)
                         and raw fundamentals (ceqq, ibq, atq, etc.).
         """
         # Work on a copy to ensure immutability of source data
-        self.df = panel_data.copy()
+        self.panel_path = panel_path 
+        self.factors_path = factors_path
+
+        try:
+            panel_data = pd.read_parquet(self.panel_path)
+        except:
+            raise FileNotFoundError
         
+        self.df = panel_data.copy()
         # Ensure multi-index is flat for calculations, will reset later
         # This makes vectorization easier for group operations
         if isinstance(self.df.index, pd.MultiIndex):
@@ -82,14 +90,14 @@ class FactorEngine:
         # ----------------------------------------------------------------------
         # We compute the raw values for each factor component.
         # Critical: These functions handle the "Point-in-Time" lag logic internally.
-        print("Calculating Raw Descriptors (Size, Value, Momentum, WW)...")
+        print("Calculating Raw Descriptors (size, value, momentum, WW)...")
         self._calc_size()
         self._calc_value_pit() # Handles announcement lags for B/M and E/P
         self._calc_momentum()
         self._calc_whited_wu()
         
         # 3. Clean Infinite values
-        # Log transformations (like Size) can produce -Inf for penny stocks.
+        # Log transformations (like size) can produce -Inf for penny stocks.
         descriptor_cols = ['size_desc', 'bm_desc', 'ep_desc', 'mom12_1_desc', 'mom6_1_desc', 'ww_desc']
         self.df[descriptor_cols] = self.df[descriptor_cols].replace([np.inf, -np.inf], np.nan)
         
@@ -118,28 +126,28 @@ class FactorEngine:
         # We combine correlated descriptors into single robust factors to reduce noise.
         print("Building Composite Factors...")
         
-        # Value = Average(Z_BM, Z_EP)
-        # Combines Balance Sheet Value (Book/Price) with Income Statement Value (Earnings/Price)
-        self.df['Value_composite'] = self.df[['z_bm_desc', 'z_ep_desc']].mean(axis=1)
+        # value = Average(Z_BM, Z_EP)
+        # Combines Balance Sheet value (Book/Price) with Income Statement value (Earnings/Price)
+        self.df['value_composite'] = self.df[['z_bm_desc', 'z_ep_desc']].mean(axis=1)
         
-        # Momentum = Average(Z_Mom12-1, Z_Mom6-1)
+        # momentum = Average(Z_Mom12-1, Z_Mom6-1)
         # Smooths the momentum signal by averaging the 1-year and 6-month horizons
-        self.df['Momentum_composite'] = self.df[['z_mom12_1_desc', 'z_mom6_1_desc']].mean(axis=1)
+        self.df['momentum_composite'] = self.df[['z_mom12_1_desc', 'z_mom6_1_desc']].mean(axis=1)
         
         # ----------------------------------------------------------------------
         # 6. FINAL RE-STANDARDIZATION
         # ----------------------------------------------------------------------
         # Compositing changes the distribution variance. We re-standardize the final 
         # composites to ensure they are strictly N(0,1) for the regression engine.
-        self.df['Value'] = self.df.groupby('date')['Value_composite'].transform(
+        self.df['value'] = self.df.groupby('date')['value_composite'].transform(
             lambda x: self._standardize_cap_weighted(x, self.df.loc[x.index, 'cap_weight'])
         )
-        self.df['Momentum'] = self.df.groupby('date')['Momentum_composite'].transform(
+        self.df['momentum'] = self.df.groupby('date')['momentum_composite'].transform(
             lambda x: self._standardize_cap_weighted(x, self.df.loc[x.index, 'cap_weight'])
         )
         
         # Rename single descriptors for consistency
-        self.df.rename(columns={'z_size_desc': 'Size', 'z_ww_desc': 'FinConstraint'}, inplace=True)
+        self.df.rename(columns={'z_size_desc': 'size', 'z_ww_desc': 'fin_constraint'}, inplace=True)
         
         # ----------------------------------------------------------------------
         # 7. ONE-HOT ENCODING (INDUSTRY DUMMIES)
@@ -151,20 +159,23 @@ class FactorEngine:
         # ----------------------------------------------------------------------
         # 8. ASSEMBLE FINAL X MATRIX
         # ----------------------------------------------------------------------
-        style_factors = ['Size', 'Value', 'Momentum', 'FinConstraint']
+        style_factors = ['size', 'value', 'momentum', 'fin_constraint']
         
         # Set index back to (date, permno) for the final output
         final_df = self.df.set_index(['date', 'permno'])
-        X = final_df[style_factors].join(industry_dummies.set_index(self.df.index))
+        industry_dummies.index = final_df.index
+
+        X = final_df[style_factors].join(industry_dummies)
         X.index = final_df.index # Align indices explicitly
         
         # Drop rows missing ANY factor.
-        # Why? The cross-sectional regression (Factor Return Estimation) requires 
+        # The cross-sectional regression (Factor Return Estimation) requires 
         # complete data. A missing factor exposure breaks the linear algebra solver.
         X.dropna(inplace=True)
         
         print(f"Factor Construction Complete. Final Shape: {X.shape}")
-        return X
+        X.to_parquet(self.factors_path)
+        print(f"Factor Exposures Saved to: {self.factors_path}")
 
     # -------------------------------------------------------------------------
     #                            FACTOR LOGIC
@@ -172,7 +183,7 @@ class FactorEngine:
 
     def _calc_size(self):
         """
-        Size Factor.
+        size Factor.
         Definition: Natural Log of Total Market Capitalization.
         Proxy for: Information asymmetry and liquidity risk.
         """
@@ -180,7 +191,7 @@ class FactorEngine:
 
     def _calc_value_pit(self):
         """
-        Value Factor (Point-in-Time).
+        value Factor (Point-in-Time).
         
         Implementation Detail:
         Instead of assuming data is available at quarter-end, we use `merge_asof`
@@ -194,56 +205,34 @@ class FactorEngine:
            Matches Price(t) with Trailing 12M Earnings, using a 3-month reporting lag.
         """
         # --- Book-to-Market ---
-        # Isolate Book Equity Data
-        cols_bm = ['permno', 'datadate', 'rdq', 'ceqq']
-        fund_bm = self.df[cols_bm].copy().dropna(subset=['datadate']).drop_duplicates()
-        
-        # Define Availability Date: 
-        # Use explicit Earnings Announcement Date (RDQ) if available.
-        # Fallback: Assume a conservative 6-month lag from fiscal year-end if RDQ is missing.
-        fund_bm['announcement_date'] = fund_bm['rdq'].fillna(
-            fund_bm['datadate'] + pd.DateOffset(months=6)
-        )
-        fund_bm.rename(columns={'ceqq': 'be_lag'}, inplace=True)
-        
-        # Merge back to Main Panel using AsOf (PIT)
-        self.df = pd.merge_asof(
-            left=self.df.sort_values('date'),
-            right=fund_bm[['permno', 'announcement_date', 'be_lag']].sort_values('announcement_date'),
-            left_on='date',
-            right_on='announcement_date',
-            by='permno'
-        )
-        self.df['bm_desc'] = self.df['be_lag'] / self.df['mkt_cap']
+        self.df['bm_desc'] = self.df['ceqq'] / self.df['mkt_cap']
 
         # --- Earnings-to-Price ---
         # Isolate Earnings Data
-        cols_ep = ['permno', 'datadate', 'rdq', 'ibq']
+        cols_ep = ['permno', 'datadate', 'effective_date', 'ibq']
         fund_ep = self.df[cols_ep].copy().dropna(subset=['datadate']).drop_duplicates()
         fund_ep.sort_values(['permno', 'datadate'], inplace=True)
         
         # Calculate LTM Earnings (Rolling 4 quarters sum)
         fund_ep['ltm_earn'] = fund_ep.groupby('permno')['ibq'].rolling(4, min_periods=4).sum().values
         
-        # Define Availability Date: RDQ or DataDate + 3 Months (Standard quarterly lag)
-        fund_ep['announcement_date'] = fund_ep['rdq'].fillna(
-            fund_ep['datadate'] + pd.DateOffset(months=3)
-        )
+
         fund_ep.dropna(subset=['ltm_earn'], inplace=True)
         
         # Merge back
         self.df = pd.merge_asof(
-            left=self.df.sort_values('date'),
-            right=fund_ep[['permno', 'announcement_date', 'ltm_earn']].sort_values('announcement_date'),
-            left_on='date',
-            right_on='announcement_date',
-            by='permno'
+                        left=self.df.sort_values('date'),
+                        right=fund_ep[['permno', 'effective_date', 'ltm_earn']].sort_values('effective_date'),
+                        left_on='date',
+                        right_on='effective_date',
+                        by='permno', 
+                        direction = 'backward'
         )
         self.df['ep_desc'] = self.df['ltm_earn'] / self.df['mkt_cap']
 
     def _calc_momentum(self):
         """
-        Momentum Factor.
+        momentum Factor.
         
         We calculate two horizons to capture the robust price trend:
         1. 12-1 Month: Return from t-12 to t-1 (Standard academic momentum).
@@ -256,13 +245,13 @@ class FactorEngine:
         self.df.sort_values(['permno', 'date'], inplace=True)
         
         # Helper lambda for geometric compounding
-        compound = lambda x: (1 + x).prod() - 1
+        self.df['log_ret'] = np.log1p(self.df['ret_monthly'])
         
-        grouped = self.df.groupby('permno')['ret_monthly']
+        grouped = self.df.groupby('permno')['log_ret']
         
         # Note: shift(1) excludes current month
-        self.df['mom12_1_desc'] = grouped.transform(lambda x: x.shift(1).rolling(11).apply(compound))
-        self.df['mom6_1_desc'] = grouped.transform(lambda x: x.shift(1).rolling(5).apply(compound))
+        self.df['mom12_1_desc'] = grouped.transform(lambda x: np.expm1(x.shift(1).rolling(11).sum()))
+        self.df['mom6_1_desc'] = grouped.transform(lambda x: np.expm1(x.shift(1).rolling(11).sum()))
 
     def _calc_whited_wu(self):
         """
@@ -272,10 +261,10 @@ class FactorEngine:
         - Cash Flow / Assets (-)
         - Dividend Payer Status (-)
         - Leverage (+)
-        - Size (-)
+        - size (-)
         - Sales Growth (-)
         
-        Interpretation: Higher Value = Higher Constraint (More Distress).
+        Interpretation: Higher value = Higher Constraint (More Distress).
         """
         # Components
         cf_at = (self.df['ibq'] + self.df['dpq']) / self.df['atq']
@@ -284,7 +273,7 @@ class FactorEngine:
         ln_at = np.log(self.df['atq'].replace(0, np.nan))
         
         # Sales Growth (SG)
-        sg = self.df.sort_values('date').groupby('permno')['saleq'].pct_change()
+        sg = self.df.sort_values('date').groupby('permno')['saleq'].pct_change(fill_method= None)
         
         # Industry Sales Growth (ISG) - Mean SG per Industry-Date
         self.df['sg_temp'] = sg
@@ -341,8 +330,8 @@ class FactorEngine:
         std_w = np.sqrt(var_w)
         
         if std_w == 0: return pd.Series(0.0, index=series.index)
-        
-        return (series - mean_w) / std_w
+        z_score_valid = (s - mean_w) / std_w
+        return z_score_valid.reindex(series.index)
 
     @staticmethod
     def _sic_to_ff12(sic) -> str:

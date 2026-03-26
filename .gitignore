@@ -17,6 +17,8 @@ venv/
 data/
 outputs/
 temp/
+secrets/
+*.json
 
 # --- IDE Settings ---
 .vscode/
